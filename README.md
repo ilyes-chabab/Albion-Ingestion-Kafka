@@ -1,363 +1,182 @@
-# Étape 1 – Cadrage du besoin
+# Albion Online : pipeline d'ingestion Kafka
 
-## 1.1. Contexte du projet
-
-Dans le cadre de ce projet, nous souhaitons mettre en place une chaîne de collecte et d'ingestion de données permettant de récupérer, transporter, contrôler et stocker des données structurées.
-
-Pour réaliser ce travail, nous allons nous appuyer sur un projet précédemment développé autour du jeu vidéo **Albion Online**. Ce projet avait pour objectif de récupérer les données du marché du jeu à partir de son API, afin de suivre les prix des différents objets disponibles dans les villes du jeu.
-
-Les données récupérées étaient ensuite enregistrées dans une base de données SQL. À partir de cette base, un export était réalisé au format **Parquet**, avant de publier les fichiers sur la plateforme Hugging Face pour les rendre accessibles et réutilisables.
-
-Nous allons donc réutiliser les données produites par ce premier projet comme source d'entrée pour notre nouvelle chaîne d'ingestion.
-
-La source utilisée est le dataset Hugging Face suivant :
-
-**Albion Online Market Prices**  
-https://huggingface.co/datasets/Sayli84/albion-online-market-prices
-
-Ce choix permet de travailler sur des données réelles issues d'une collecte existante, tout en séparant le processus de collecte initial de celui de l'ingestion et du traitement.
-
-## 1.2. Besoin métier et problématique analytique
-
-Le marché d'Albion Online évolue régulièrement en fonction de l'offre et de la demande des joueurs. Les prix des objets peuvent varier selon les villes, leur qualité et les périodes d'observation.
-
-L'exploitation de ces données permet notamment :
-- De comparer les prix d'un même objet entre différentes villes.
-- D'étudier les variations des prix minimums et maximums.
-- De comparer les prix d'achat et de vente.
-- D'identifier des opportunités potentielles d'achat et de revente.
-- De mieux comprendre l'évolution du marché du jeu.
-
-La problématique principale de notre projet est donc la suivante :
-
-**Comment mettre en place une chaîne d'ingestion automatisée et fiable permettant de récupérer les données du marché d'Albion Online depuis Hugging Face, de les transporter avec Kafka, de les traiter et de contrôler leur qualité ?**
-
-L'objectif est également de rendre le processus reproductible grâce à Airflow et de pouvoir identifier les éventuelles erreurs pendant l'ingestion.
-
-## 1.3. Identification de la source de données
-
-La source de données utilisée est le dataset *Albion Online Market Prices*, hébergé sur Hugging Face.
-
-| Caractéristique | Description |
-|---|---|
-| Source initiale | API du marché d'Albion Online |
-| Projet de collecte | Projet personnel Albion Online |
-| Stockage initial | Base de données SQL |
-| Format des fichiers | Parquet |
-| Hébergement | Hugging Face |
-| Nom du dataset | Sayli84/albion-online-market-prices |
-| Fichier | `data/market_prices.parquet` (fichier unique) |
-| Taille approximative | 431 Ko |
-| Nombre de lignes | 47 926 |
-| Périmètre | Serveur européen d'Albion Online |
-| Accès | Dataset public mais à accès contrôlé (*gated*) : authentification par token Hugging Face obligatoire |
-| Fréquence de mise à jour | Publication ponctuelle par snapshot (dernière mise à jour : 6 novembre 2026) |
-| Type de données | Données structurées sur les prix du marché |
-
-Les fichiers Parquet contiennent les informations suivantes :
-
-| Colonne | Description |
-|---|---|
-| `item_id` | Identifiant de l'objet dans le jeu |
-| `city` | Ville dans laquelle le prix est observé |
-| `quality` | Niveau de qualité de l'objet |
-| `sell_price_min` | Prix minimum de vente |
-| `sell_price_min_date` | Date associée au prix minimum de vente |
-| `sell_price_max` | Prix maximum de vente |
-| `sell_price_max_date` | Date associée au prix maximum de vente |
-| `buy_price_min` | Prix minimum d'achat |
-| `buy_price_min_date` | Date associée au prix minimum d'achat |
-| `buy_price_max` | Prix maximum d'achat |
-| `buy_price_max_date` | Date associée au prix maximum d'achat |
-
-Types observés dans le fichier : `item_id` et `city` sont des chaînes, `quality` un entier de 1 à 5, les prix des décimaux (`double`) et les dates des `timestamp` sans fuseau horaire. Le fichier couvre 8 villes, dont le **Black Market**, et des observations allant du 3 au 4 novembre 2026.
-
-Le format Parquet a été conservé dans le projet initial pour stocker les données de manière structurée et compacte. Dans le nouveau pipeline, ces données seront lues avec Python, puis transformées en messages JSON pour être envoyées dans Kafka.
-
-### Accès à la source
-
-- **Protocole** : HTTPS, via la bibliothèque `huggingface_hub` (ou l'URL `https://huggingface.co/datasets/Sayli84/albion-online-market-prices/resolve/main/data/market_prices.parquet`).
-- **Authentification** : le dataset est *gated*. Une requête anonyme renvoie une erreur `401`. Il faut un compte Hugging Face ayant accepté les conditions d'accès, ainsi qu'un token de lecture. Ce token est fourni par variable d'environnement (`HF_TOKEN`, dans un fichier `.env`) et n'est jamais versionné dans le dépôt.
-- **Fichier de données non versionné** : le Parquet est téléchargé dans `data/input/` à chaque exécution et ignoré par Git. Le versionner rendrait le dataset accessible sans passer par le contrôle d'accès de Hugging Face, ce que la consigne déconseille aussi.
-- **Détection des nouveautés** : l'API Hugging Face (`/api/datasets/Sayli84/albion-online-market-prices`) expose le hash du dernier commit (`sha`) et la date `lastModified`. Le connecteur pourra ainsi savoir si le fichier a changé depuis la dernière ingestion sans le retélécharger.
-
-### Limites de la source
-
-- **Pas de temps réel** : le fichier est un snapshot figé. Il ne reflète l'état du marché qu'au moment de son export depuis la base SQL.
-- **Pas d'incrémental natif** : le fichier est remplacé en entier à chaque publication. L'extraction incrémentale doit donc se faire côté pipeline (comparaison du `sha` et déduplication sur une clé métier).
-- **Données collaboratives** : les prix de l'Albion Online Data Project proviennent des clients des joueurs. Certains couples objet / ville / qualité peuvent être absents ou anciens.
-- **Prix manquants** : quand aucun ordre n'existe, le prix vaut `0.0` et la date associée est nulle. C'est le cas pour 70 % des prix de vente (33 401 lignes) et 84 % des prix d'achat (40 205 lignes). La validation devra traiter ces valeurs comme des absences de prix, et non comme des prix gratuits.
-- **Doublons dans la source** : 280 combinaisons `item_id` / `city` / `quality` apparaissent plusieurs fois dans le fichier (47 640 combinaisons distinctes pour 47 926 lignes). La déduplication est donc nécessaire.
-- **Dépendance à un service tiers** : la disponibilité de Hugging Face, les limites de débit et le jeton d'accès peuvent provoquer des erreurs de téléchargement. Le connecteur devra donc gérer les reprises.
-- **Périmètre limité** : seul le serveur européen est couvert.
-
-## 1.4. Analyse des caractéristiques des données : volume, vélocité et variété
-
-Les données peuvent être caractérisées selon les trois dimensions suivantes :
-
-**Volume**
-
-Le dataset contient 47 926 lignes pour une taille totale d'environ 431 Ko. Ce volume reste relativement faible, ce qui permet de réaliser les traitements avec des ressources informatiques limitées. Il est néanmoins suffisant pour tester les mécanismes d'ingestion, de transport et de validation de Kafka.
-
-**Vélocité**
-
-Dans le projet initial, les données étaient récupérées régulièrement depuis l'API du marché d'Albion Online. Les fichiers Parquet publiés sur Hugging Face sont donc issus de collectes périodiques.
-
-Côté Hugging Face, la vélocité est faible : le dataset est publié sous forme de snapshot, sans flux continu. Nous planifierons donc une vérification **quotidienne**. Si le `sha` du dataset n'a pas changé depuis la dernière exécution, le pipeline s'arrête sans rien republier. S'il a changé, le fichier complet est réingéré.
-
-**Variété**
-
-Les données sont structurées sous forme de colonnes dans des fichiers Parquet. Elles contiennent des identifiants d'objets, des villes, des niveaux de qualité, des prix et des dates d'observation. Il s'agit donc principalement de données numériques et textuelles organisées selon un schéma défini.
-
-La variété est faible : une seule source, un seul format et un schéma stable.
-
-| Dimension | Niveau | Conséquence pour le pipeline |
-|---|---|---|
-| Volume | Faible (47 926 lignes, environ 431 Ko) | Traitement en mémoire avec pandas, sans moteur distribué |
-| Vélocité | Faible (snapshots ponctuels) | Ingestion par lots planifiée, pas de streaming temps réel |
-| Variété | Faible (Parquet, schéma fixe) | Un contrat de données unique (JSON Schema) suffit |
-
-## 1.5. Choix du mode d'ingestion
-
-Nous avons choisi une ingestion par lots (*batch ingestion*) à partir des fichiers Parquet disponibles sur Hugging Face.
-
-Ce choix est cohérent avec notre source, puisque nous exploitons des fichiers déjà générés par le projet précédent, et non un flux directement connecté à l'API du jeu.
-
-| Pattern | Adapté ? | Justification |
-|---|---|---|
-| **Batch (par lots)** | ✅ Retenu | La source est un fichier complet publié ponctuellement. Le volume est faible et il n'y a pas d'exigence de temps réel. |
-| Streaming temps réel | ❌ | La source n'émet aucun flux d'événements. Interroger en continu un fichier statique n'apporterait rien. |
-| Micro-batch | ❌ | Il n'y a rien à découper finement : le fichier change en bloc. |
-| CDC (*Change Data Capture*) | ❌ | Nous n'avons pas accès au journal de la base SQL d'origine, seulement à l'export Parquet. |
-
-Kafka reste pertinent malgré l'ingestion par lots. Il découple la lecture de la source du traitement et rend possible le rejeu des messages (rétention des offsets). Il permet aussi d'isoler les messages invalides dans un topic DLQ dédié.
-
-Le fonctionnement prévu est le suivant :
-
-1. Récupération du dataset Parquet depuis Hugging Face.
-2. Lecture du fichier avec Python.
-3. Vérification et normalisation des données.
-4. Transformation de chaque ligne en message JSON.
-5. Publication des messages dans un topic Kafka.
-6. Consommation des messages et validation de leur structure.
-7. Stockage des données valides et envoi des données invalides dans une Dead Letter Queue (DLQ).
-
-Airflow sera utilisé pour orchestrer et planifier les différentes étapes du pipeline. Des mécanismes de journalisation et de suivi permettront également de contrôler les traitements et de détecter les erreurs.
-
-## 1.6. Architecture générale envisagée
-
-L'architecture globale repose sur deux parties complémentaires.
-
-La première correspond au projet Albion déjà réalisé, qui assure la collecte initiale des données :
-
-**API Albion Online → Script de collecte → Base de données SQL → Export Parquet → Hugging Face**
-
-La deuxième correspond au nouveau projet d'ingestion :
-
-**Hugging Face → Connecteur Python → Kafka → Consommateur → Validation et traitement → Stockage des résultats**
+Pipeline batch qui récupère les prix du marché d'Albion Online depuis Hugging Face, les transporte avec Kafka, puis les valide et les normalise. Les messages rejetés sont isolés dans une DLQ.
 
 ```mermaid
 flowchart LR
-    subgraph Amont["Projet existant (collecte initiale)"]
-        API[API Albion Online<br/>Data Project] --> COL[Script de collecte] --> SQL[(Base SQL)] --> EXP[Export Parquet]
-    end
-
-    EXP --> HF[(Hugging Face<br/>market_prices.parquet)]
-
-    subgraph Pipeline["Nouveau pipeline d'ingestion"]
-        HF -->|HTTPS + HF_TOKEN<br/>vérification du sha| CON[Connecteur Python<br/>connectors/]
-        CON -->|messages JSON| PROD[Producer Kafka]
-        PROD --> T1[[Topic<br/>albion.market.prices]]
-        T1 --> CONS[Consumer + validation<br/>validation/ JSON Schema]
-        CONS -->|valides, normalisés,<br/>dédupliqués| OUT[(data/output/)]
-        CONS -->|invalides +<br/>métadonnées d'erreur| DLQ[[Topic DLQ<br/>albion.market.prices.dlq]]
-    end
-
-    AF{{Apache Airflow<br/>DAG quotidien}} -.orchestre.-> CON
-    AF -.orchestre.-> CONS
-    LOG[/Logs structurés<br/>+ métriques/] -.-> Pipeline
+    HF[(Hugging Face<br/>market_prices.parquet)] -->|sha + HF_TOKEN| CON[Connecteur]
+    CON --> PROD[Producer] --> RAW[[albion.market.prices]]
+    RAW --> VAL[Validateur] -->|valides| OK[[albion.market.prices.validated]]
+    VAL -->|rejetés| DLQ[[albion.market.prices.dlq]]
+    RAW -.-> CONS[consumer.py] -.-> OUT[(data/output/)]
+    AF{{Airflow · à venir}} -.-> CON
+    AF -.-> VAL
 ```
 
-> Les topics, partitions et clés sont détaillés et justifiés à l'étape 3.
+## Démarrage rapide
 
-Apache Airflow interviendra pour orchestrer les différentes étapes du nouveau pipeline. Kafka assurera le transport des messages, tandis que le système de validation permettra de distinguer les données conformes des données invalides. Ces dernières seront isolées dans une DLQ afin de pouvoir être analysées.
+```bash
+docker compose up -d kafka kafka-ui                 # Kafka :9092, Kafka-UI http://localhost:8081
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+echo "HF_TOKEN=hf_xxx" > .env                       # token Hugging Face (dataset à accès contrôlé)
 
-Cette architecture permet de réutiliser un travail existant tout en construisant une nouvelle chaîne d'ingestion indépendante, automatisée et contrôlable.
-# Étape 3 – Transport des données avec Kafka
+python kafka/scripts/create_topics.py
+python kafka/scripts/producer.py --source connector # ne publie rien si le dataset n'a pas changé
+python validation/validator.py                      # brut -> validated / DLQ
+python kafka/scripts/check_topics.py                # messages, offsets et lag par partition
+```
 
-## 3.1. Topics
+Sans token, on peut publier le jeu d'exemple : `python kafka/scripts/generate_sample.py`, puis `python kafka/scripts/producer.py --source data/input/sample_market_prices.jsonl`.
 
-| Topic | Partitions | Rétention | Rôle |
-|---|---|---|---|
-| `albion.market.prices` | 3 | 7 jours | Prix du marché, un message par couple objet / ville / qualité |
-| `albion.market.prices.dlq` | 1 | 30 jours | *Dead-Letter Queue* : messages rejetés, avec les métadonnées de leur erreur |
+---
 
-Les topics sont décrits dans [`kafka/scripts/config.py`](kafka/scripts/config.py) et créés par [`kafka/scripts/create_topics.py`](kafka/scripts/create_topics.py). Ce script peut être relancé sans risque : un topic déjà existant est conservé tel quel.
+## Étape 1 · Cadrage
 
-**Pourquoi 3 partitions pour les prix ?** Le volume (47 926 messages par lot) tiendrait sur une seule partition. Avec 3 partitions, on peut lancer jusqu'à 3 consumers en parallèle dans le même groupe si le volume augmente, par exemple en ajoutant d'autres serveurs du jeu. Ce nombre reste assez faible pour un seul broker et permet de vérifier concrètement la répartition des messages. Dans Kafka, on peut augmenter le nombre de partitions plus tard mais jamais le diminuer : partir petit est donc le choix prudent.
+**Contexte.** Un projet précédent collecte les prix du marché d'Albion Online (API de l'Albion Online Data Project, puis base SQL, puis export Parquet) et les publie sur Hugging Face. Ce projet en réutilise la sortie comme source.
 
-**Pourquoi 1 partition pour la DLQ ?** Les rejets doivent rester rares. Une seule partition garde leur ordre d'arrivée, ce qui facilite l'analyse.
+**Question analytique.** Comparer les prix d'un objet selon la ville, la qualité et le moment, et repérer les écarts entre l'achat et la vente pour trouver des opportunités d'achat-revente.
 
-**Rétention.** Les 7 jours du topic des prix permettent de rejouer un lot récent en cas de problème en aval. Les 30 jours de la DLQ laissent le temps d'analyser et de corriger les rejets.
+**Source** : [`Sayli84/albion-online-market-prices`](https://huggingface.co/datasets/Sayli84/albion-online-market-prices)
 
-**Réplication.** Le facteur de réplication est de 1, car le `docker-compose.yml` ne lance qu'un seul broker. En production, on utiliserait 3 brokers, un facteur de réplication de 3 et `min.insync.replicas=2`.
-
-## 3.2. Clé de message
-
-La clé est `item_id|city|quality` (exemple : `T4_BAG|Caerleon|1`). C'est la clé métier d'une observation de prix.
-
-- **Ordre garanti par objet.** Tous les messages d'une même clé vont dans la même partition. Leur ordre est donc conservé, et une nouvelle observation d'un prix arrive toujours après l'ancienne.
-- **Déduplication facilitée.** Deux messages de même clé et de mêmes dates sont des doublons. L'étape de qualité peut les éliminer sur ce critère.
-- **Bonne répartition.** Il y a des milliers de clés différentes, donc le hachage les distribue de façon équilibrée. Avec `item_id` seul, la répartition serait plus grossière. Avec `city` seul, il n'y aurait que 7 valeurs, ce qui donnerait des partitions déséquilibrées.
-
-Les champs de la clé sont lus dans l'enveloppe `data` du message (voir 3.3). Un message auquel il manque un champ de la clé n'est pas publié. Il est comptabilisé dans `skipped`.
-
-## 3.3. Producer et consumer
-
-| Script | Rôle |
+| | |
 |---|---|
-| [`producer.py`](kafka/scripts/producer.py) | Publie les messages du connecteur (étape 2). En ligne de commande : `--source connector` pour les vraies données Hugging Face, ou `--source <fichier.jsonl>` pour un fichier JSON Lines. En Python : `publish(extract_data(), run_id=...)`. |
-| [`consumer.py`](kafka/scripts/consumer.py) | Lit le topic des prix et écrit les messages dans `data/output/market_prices.jsonl`. Un message illisible est envoyé dans la DLQ. Le script s'arrête après une période sans message, ce qui le rend utilisable depuis Airflow. |
-| [`check_topics.py`](kafka/scripts/check_topics.py) | Affiche, pour chaque partition, le nombre de messages, l'offset commité et le *lag* (messages restant à lire). |
-| [`generate_sample.py`](kafka/scripts/generate_sample.py) | Génère un jeu fictif de 300 lignes au format du connecteur (`data/input/sample_market_prices.jsonl`), pour tester Kafka sans token Hugging Face. |
+| Format | Un fichier Parquet, `data/market_prices.parquet` (431 Ko, 47 926 lignes) |
+| Accès | HTTPS via `huggingface_hub`. Dataset *gated* : il faut un token (`HF_TOKEN` dans `.env`, jamais versionné) |
+| Fréquence | Snapshot publié ponctuellement (dernière version : 6 novembre 2026), identifié par son `sha` |
+| Périmètre | Serveur européen, 8 villes (dont le Black Market), qualités 1 à 5 |
+| Colonnes | `item_id`, `city`, `quality`, et 4 prix (`sell`/`buy` × `min`/`max`), chacun avec sa date |
 
-**Format d'un message.** La valeur reprend l'enveloppe produite par le connecteur, sérialisée en JSON. Les timestamps du Parquet sont convertis au format ISO 8601.
+**Limites de la source**
+- **Snapshot figé.** Le fichier ne contient pas de temps réel et il est remplacé en entier à chaque version : il n'y a pas d'extraction incrémentale native.
+- **Prix souvent absents.** Un prix à `0` avec une date `null` signifie « aucun ordre ». C'est le cas pour 70 % des prix de vente et 84 % des prix d'achat.
+- **Observations multiples.** 280 couples objet / ville / qualité apparaissent plusieurs fois, à des heures différentes. Ce sont des observations successives, **pas des doublons**.
+- **Données collaboratives.** Les prix sont remontés par les joueurs : certains objets ou villes peuvent manquer.
+- **Fichier non versionné.** Le Parquet n'est pas dans le dépôt, pour respecter le contrôle d'accès de Hugging Face.
 
-```json
-{
-  "source": "HF_albion_online_market_prices",
-  "dataset_sha": "7bec455e16acef0b4646d33a0ef646a53759ebc5",
-  "extract_date": "2026-11-27T10:19:38.287640+00:00",
-  "data": {
-    "item_id": "T3_MAIN_ARCANESTAFF", "city": "Black Market", "quality": 2,
-    "sell_price_min": 0.0, "sell_price_min_date": null,
-    "sell_price_max": 0.0, "sell_price_max_date": null,
-    "buy_price_min": 708.0, "buy_price_min_date": "2026-11-04T06:45:00",
-    "buy_price_max": 3658.0, "buy_price_max_date": "2026-11-04T06:45:00"
-  }
-}
-```
+**3V et choix du pattern**
 
-Les métadonnées techniques propres à Kafka sont placées dans les *headers*, pour ne pas les mélanger avec les données :
+| | Niveau | Conséquence |
+|---|---|---|
+| Volume | Faible (environ 48 000 lignes) | Traitement en mémoire, sans moteur distribué |
+| Vélocité | Faible (snapshots ponctuels) | **Batch** quotidien. Pas de streaming : la source n'émet aucun flux |
+| Variété | Faible (un format, un schéma) | Un seul contrat de données |
 
-| Header | Contenu |
-|---|---|
-| `message_id` | UUID unique du message : identifiant de corrélation, réutilisable à l'étape 6 |
-| `run_id` | Identifiant du lot (par exemple l'identifiant du run Airflow) |
-| `produced_at` | Horodatage UTC de la publication |
-| `source` | Recopié du champ `source` du message |
-| `dataset_sha` | Version du dataset Hugging Face d'où vient le message |
+Le streaming, le micro-batch et le CDC sont écartés : le fichier change en bloc, et nous n'avons pas accès à la base SQL d'origine. Kafka reste utile pour découpler l'extraction du traitement, pour rejouer les messages et pour isoler les rejets.
 
-Un message envoyé dans la DLQ conserve ses headers d'origine. On y ajoute `error`, `error_stage`, `original_topic`, `original_partition`, `original_offset` et `failed_at`.
+## Étape 2 · Connecteur
 
-## 3.4. Vérification
+[`connectors/albion_connector.py`](connectors/albion_connector.py)
 
-**Test 1 : données réelles.** Le fichier `market_prices.parquet` (47 926 lignes) passe par le connecteur de l'étape 2, plus le jeu d'exemple (300 lignes) :
-
-```
-$ python kafka/scripts/producer.py --source connector
-"sent": 47926, "delivered": 47926, "failed": 0, "skipped": 0,
-"per_partition": {"0": 15915, "1": 15963, "2": 16048}
-
-$ python kafka/scripts/consumer.py
-"consumed": 48226, "written": 48226, "dlq": 0
-
-$ python kafka/scripts/check_topics.py
-albion.market.prices  (3 partition(s), 48226 message(s))
-  partition  messages   part   commité    lag
-          0     16004    33%     16004      0
-          1     16062    33%     16062      0
-          2     16160    34%     16160      0
-```
-
-- **Publication** : les 47 926 lignes réelles ont été livrées, sans échec ni ligne écartée.
-- **Consommation** : le lag est à 0 sur toutes les partitions, donc tout a été lu.
-- **Répartition** : 33 % / 33 % / 34 %. La clé répartit les messages de façon équilibrée, et aucune clé ne se retrouve sur deux partitions différentes.
-
-**Test 2 : message invalide.** Un message qui n'est pas du JSON (`{pas du json`) est injecté avec `kafka-console-producer` :
-
-```
-$ python kafka/scripts/consumer.py
-"consumed": 301, "written": 300, "dlq": 1
-```
-
-Le message est arrivé dans la DLQ avec l'erreur `JSON invalide : Expecting property name…` et sa position d'origine (partition 1, offset 95).
-
-Les messages sont aussi visibles dans Kafka-UI : http://localhost:8081.
-
-> Le lag affiché pour la DLQ est normal : aucun consumer ne lit encore ce topic. Son traitement relève de l'étape 5.
-
-## 3.5. Stratégie de reprise et risques de doublons
-
-**Côté producer**
-- `enable.idempotence=true` et `acks=all` : si un envoi échoue (coupure réseau, broker lent), le producer le renvoie automatiquement, jusqu'à 10 tentatives en 2 minutes au maximum. Kafka élimine les doublons créés par ces renvois.
-- Si la file d'envoi locale est pleine, le producer attend et réessaie au lieu de perdre le message.
-- À la fin, `publish()` renvoie le nombre de messages livrés et en échec. La tâche Airflow pourra échouer, puis être relancée, si `failed > 0`.
-
-**Côté connecteur : extraction incrémentale par `sha`**
-
-Le dataset est remplacé en entier à chaque publication. On ne peut donc pas extraire « seulement les nouvelles lignes ». On ne republie le fichier que s'il a changé :
-
-1. `check_new_version()` lit le `sha` actuel du dataset dans l'API Hugging Face. Ces métadonnées sont publiques : aucun token n'est nécessaire à cette étape.
-2. Il compare ce `sha` à celui de la dernière ingestion réussie, enregistré dans `data/state/last_ingested.json`.
-3. Si le `sha` est identique, rien n'est publié (`"status": "unchanged"`).
-4. Sinon, le fichier est téléchargé **à cette version précise** (`revision=sha`). On est ainsi sûr que les données correspondent bien au `sha` enregistré.
-5. Le `sha` n'est enregistré qu'une fois **tous** les messages livrés à Kafka. Si la publication échoue, la version n'est pas marquée et sera republiée au prochain lancement.
+- **Extraction incrémentale par `sha`.** Le connecteur lit la version du dataset sur l'API Hugging Face (publique, sans token) et la compare à la dernière version ingérée (`data/state/last_ingested.json`). Si elle n'a pas changé, il n'y a rien à faire.
+- **Téléchargement à une version précise** (`revision=sha`), avec le token.
+- **Messages structurés.** Chaque ligne devient `{source, dataset_sha, extract_date, data: {...}}`.
+- **Sha enregistré en dernier.** Il n'est enregistré qu'une fois **tous** les messages livrés à Kafka. Si la publication échoue, la version sera retentée au prochain lancement.
 
 | Scénario testé | Résultat |
 |---|---|
-| Première ingestion | 47 926 messages publiés, `sha` enregistré (`status: ingested`) |
-| Relance, dataset inchangé | 0 message publié (`status: unchanged`) |
-| Kafka arrêté pendant la publication | 47 926 échecs, `sha` **non** enregistré (`status: failed`) |
-| Relance après le retour de Kafka | 47 926 messages publiés, `sha` enregistré |
-| `--force` | Republication même sans changement, pour rejouer un lot volontairement |
+| Première ingestion | 47 926 messages publiés, sha enregistré |
+| Relance sans changement | 0 message publié |
+| Kafka arrêté pendant la publication | Échec, sha **non** enregistré |
+| Relance après le retour de Kafka | 47 926 messages publiés |
 
-Le dossier `data/state/` n'est pas versionné, car il décrit l'état d'une installation.
+## Étape 3 · Kafka
 
-**Côté consumer : garantie « au moins une fois »**
-- L'auto-commit est désactivé. Pour chaque lot de messages, le consumer : 1) écrit sur disque (avec `fsync`) et dans la DLQ, 2) commite seulement ensuite les offsets.
-- **Arrêt avant le commit** : les messages déjà écrits sont relus au redémarrage. On obtient des doublons, mais aucune perte.
-- **Arrêt avant l'écriture** : rien n'est commité, donc les messages sont relus. Il n'y a ni perte ni doublon.
-- **Relance normale** : le consumer reprend à l'offset commité. Vérifié : une seconde exécution lit 0 message.
+| Topic | Partitions | Rétention | Rôle |
+|---|---|---|---|
+| `albion.market.prices` | 3 | 7 j | Messages bruts |
+| `albion.market.prices.validated` | 3 | 7 j | Messages validés et normalisés (étape 5) |
+| `albion.market.prices.dlq` | 1 | 30 j | Messages rejetés et raison du rejet |
 
-**Doublons qui subsistent, et comment les traiter**
+- **3 partitions.** Une seule suffirait pour le volume actuel. Trois permettent de lancer 3 consumers en parallèle si le volume augmente. On peut ajouter des partitions plus tard, jamais en retirer.
+- **1 partition pour la DLQ.** Les rejets sont rares, et une seule partition garde leur ordre d'arrivée.
+- **Facteur de réplication de 1**, car il n'y a qu'un seul broker en local. En production : 3 brokers et `min.insync.replicas=2`.
+- **Clé `item_id|city|quality`.** Toutes les observations d'un même objet tombent dans la même partition, donc dans l'ordre. La clé prend des milliers de valeurs, ce qui donne une répartition équilibrée : **33 % / 33 % / 34 %** mesurés.
+- **Headers.** Chaque message porte `message_id` (identifiant de corrélation), `run_id`, `produced_at`, `source` et `dataset_sha`.
 
-| Cas | Cause | Traitement |
-|---|---|---|
-| Doublons présents dans le fichier source | 280 clés apparaissent plusieurs fois dans le Parquet | Déduplication à l'étape 5 |
-| Crash du consumer entre l'écriture et le commit | Garantie « au moins une fois » | Déduplication à l'étape 5 sur la clé `item_id\|city\|quality` et les dates de prix |
-| Relance du producer sur le même lot | Ne se produit plus qu'avec `--force`, ou après un échec partiel. Le fichier source est alors republié entièrement. Vérifié : republier les 300 lignes du jeu d'exemple ajoute 300 messages, sur les mêmes partitions. | Le connecteur ne publie pas si le `sha` du dataset n'a pas changé (voir plus haut), et la déduplication de l'étape 5 sert de filet de sécurité |
-| Relance d'une tâche Airflow | Même cas que le précédent | `run_id` fixé par Airflow, plus les deux mécanismes ci-dessus |
+**Scripts** ([`kafka/scripts/`](kafka/scripts/))
 
-Une garantie « exactement une fois » de bout en bout demanderait des transactions Kafka et une écriture transactionnelle en sortie. Pour un lot quotidien de petite taille, la combinaison « au moins une fois » et déduplication est plus simple, et suffit.
+| Script | Rôle |
+|---|---|
+| `create_topics.py` | Crée les topics. Peut être relancé sans effet |
+| `producer.py` | Publie avec `--source connector` ou `--source fichier.jsonl`. `--force` republie même sans changement |
+| `consumer.py` | Écrit les messages dans `data/output/`. Le JSON illisible part en DLQ |
+| `check_topics.py` | Affiche messages, offset commité et lag par partition |
+| `generate_sample.py` | Génère 300 lignes fictives pour tester sans token |
 
-## 3.6. Lancer l'étape 3
+**Reprise et doublons**
+- **Producer.** `enable.idempotence` et `acks=all` : les renvois automatiques (10 essais en 2 minutes) ne créent pas de doublon dans Kafka.
+- **Consumer, « au moins une fois ».** Il écrit sur disque, puis commite l'offset. Un crash entre les deux provoque une relecture : des doublons possibles, mais jamais de perte.
+- **Republication du même fichier.** Elle est évitée par le `sha` (étape 2), et le validateur l'absorbe dans tous les cas grâce au dédoublonnage (étape 5).
 
-```bash
-# 1. Démarrer Kafka et Kafka-UI
-docker compose up -d kafka kafka-ui
+## Étape 4 · Airflow
 
-# 2. Environnement Python
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+À faire : un DAG quotidien qui enchaîne les topics, le connecteur et le producer, puis le validateur. Attention : le chemin des DAGs dans `docker-compose.yml` (`./dags`) doit être corrigé en `./airflow/dags`.
 
-# 3. Créer les topics
-python kafka/scripts/create_topics.py
+## Étape 5 · Qualité des données
 
-# 4a. Publier les vraies données (HF_TOKEN dans le fichier .env, voir étape 2)
-#     Ne publie rien si le dataset n'a pas changé depuis la dernière ingestion.
-python kafka/scripts/producer.py --source connector
-python kafka/scripts/producer.py --source connector --force   # pour republier quand même
+Toute la validation se fait **après Kafka**, dans [`validation/validator.py`](validation/validator.py). Le topic brut garde tout, ce qui permet de rejouer la validation si une règle change, et chaque rejet reste traçable par sa partition et son offset.
 
-# 4b. ou publier le jeu d'exemple, sans token
-python kafka/scripts/generate_sample.py
-python kafka/scripts/producer.py --source data/input/sample_market_prices.jsonl
-
-# 5. Consommer, puis vérifier la répartition et le lag
-python kafka/scripts/consumer.py
-python kafka/scripts/check_topics.py
+```
+albion.market.prices ─► désérialiser ─► valider ─► normaliser ─► dédoublonner ─┬─► .validated
+                                                                                 └─► .dlq
 ```
 
-Variables d'environnement disponibles :
-- `KAFKA_BOOTSTRAP_SERVERS` : `localhost:9092` par défaut. Depuis un conteneur, comme Airflow, utiliser `kafka:29092`.
-- `KAFKA_TOPIC_PRICES`, `KAFKA_TOPIC_DLQ` et `KAFKA_CONSUMER_GROUP` : noms des topics et du groupe de consumers.
+**Contrat** : [`CONTRACT.md`](validation/CONTRACT.md) (sémantique, qualité, fraîcheur, évolution, version 1.0.0), [`market_price.schema.json`](validation/schemas/market_price.schema.json) (JSON Schema 2020-12) et [`rules.py`](validation/rules.py).
+- **Schéma** :
+  - champs obligatoires, `additionalProperties: false` ;
+  - `city` dans une liste fermée (`enum`) ;
+  - `quality` de 1 à 5 ;
+  - prix entiers ≥ 0 ;
+  - dates ISO 8601 ou `null`.
+- **Règles métier** :
+  - un prix > 0 a une date, et un prix à 0 n'en a pas ;
+  - min ≤ max ;
+  - la date doit exister ;
+  - une observation n'est jamais postérieure à l'extraction.
+- Le vrai fichier respecte toutes ces règles à 100 % : un rejet signale une vraie anomalie.
+
+**Normalisation**
+- Un prix à `0.0` devient `null`.
+- `708.0` devient `708`.
+- Les dates sont au format `…Z` (UTC).
+- L'enveloppe est mise à plat.
+
+**Dédoublonnage et idempotence**
+- **Empreinte.** Un doublon est un message dont le contenu normalisé est identique, d'où une empreinte SHA-256 du contenu. La clé seule ne suffit pas : elle revient à chaque nouvelle observation.
+- **Mémoire des messages traités** (`data/state/validator.sqlite`) : les empreintes pour les valides, les positions pour les rejets. Rejouer le topic ne produit aucun doublon.
+- **Ordre pour chaque lot** : livrer les sorties, puis mémoriser, puis commiter l'offset.
+
+**DLQ, format du cours.** Le corps du message contient `original_message`, `rejection_reason`, `errors`, `rejection_stage`, `rejection_timestamp`, `source_topic`, `source_partition`, `source_offset`, `validator_version` et `correlation_id`. On applique la quarantaine par défaut, une alerte au-delà de 5 %, et un arrêt immédiat en option (`--fail-on-alert`, code de sortie 2).
+
+**Logs structurés (JSON)**
+- Un WARNING par rejet, avec `error`, `field` et `correlation_id`.
+- Un bilan INFO en fin d'exécution : `validation_rate`, `top_errors`, `latest_observation` (fraîcheur).
+- Un WARNING « ALERTE » si plus de 5 % des messages sont rejetés.
+
+**Tests.** `python validation/test_rules.py` vérifie un message valide et 15 cas invalides.
+
+| Scénario de bout en bout | Résultat |
+|---|---|
+| Fichier réel et 8 messages invalides | 47 926 validés, 8 en DLQ avec leur WARNING |
+| Rejeu complet (`--replay`) | 0 nouveau message, ni dans `validated` ni dans la DLQ |
+| Republication du même fichier (`--force`) | 47 926 doublons détectés, 0 nouveau message |
+| 3 rejets sur 15 messages (20 %) | ALERTE, et code de sortie 2 |
+| Rejet d'un message publié par le producer | Son `correlation_id` et son `run_id` se retrouvent dans le log et dans la DLQ |
+
+## Étapes 6 et 7 · À faire
+
+- **Observabilité** : les logs structurés et le `correlation_id` existent déjà dans le validateur. Il reste à suivre les volumes, les erreurs et la fraîcheur, et à définir les seuils d'alerte de tout le pipeline.
+- **Tests et documentation** : exécution de bout en bout avec le vrai token, et scénario d'erreur à préparer pour la soutenance.
+- **Limite connue** : le connecteur ne réessaie pas encore automatiquement en cas d'erreur réseau vers Hugging Face. Il faut relancer l'exécution.
+
+## Configuration
+
+| Variable | Défaut |
+|---|---|
+| `HF_TOKEN` | — (dans `.env`) |
+| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` (depuis un conteneur : `kafka:29092`) |
+| `KAFKA_TOPIC_PRICES` / `KAFKA_TOPIC_VALIDATED` / `KAFKA_TOPIC_DLQ` | `albion.market.prices` / `.validated` / `.dlq` |
+| `VALIDATION_ALERT_THRESHOLD` | `0.05` |
+
+Jamais versionnés : `.env`, le Parquet téléchargé, `data/state/` et `data/output/`.

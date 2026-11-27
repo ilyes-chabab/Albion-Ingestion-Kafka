@@ -7,3 +7,6 @@ python-dotenv
 
 # Kafka (étape 3)
 confluent-kafka==2.6.1
+
+# Validation (étape 5)
+jsonschema==4.23.0

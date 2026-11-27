@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "albion/market_price.schema.json",
+  "title": "Message brut de prix du marché Albion (topic albion.market.prices)",
+  "x-contract-version": "1.0.0",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["source", "extract_date", "data"],
+  "properties": {
+    "source": {"type": "string", "minLength": 1},
+    "dataset_sha": {
+      "description": "Version du dataset Hugging Face",
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "extract_date": {"$ref": "#/$defs/datetime"},
+    "data": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "item_id", "city", "quality",
+        "sell_price_min", "sell_price_min_date", "sell_price_max", "sell_price_max_date",
+        "buy_price_min", "buy_price_min_date", "buy_price_max", "buy_price_max_date"
+      ],
+      "properties": {
+        "item_id": {"type": "string", "pattern": "^[A-Z0-9_'+@]{3,64}$"},
+        "city": {
+          "enum": ["Black Market", "Brecilien", "Bridgewatch", "Caerleon",
+                   "Fort Sterling", "Lymhurst", "Martlock", "Thetford"]
+        },
+        "quality": {"type": "integer", "minimum": 1, "maximum": 5},
+        "sell_price_min": {"$ref": "#/$defs/price"},
+        "sell_price_max": {"$ref": "#/$defs/price"},
+        "buy_price_min": {"$ref": "#/$defs/price"},
+        "buy_price_max": {"$ref": "#/$defs/price"},
+        "sell_price_min_date": {"$ref": "#/$defs/nullable_datetime"},
+        "sell_price_max_date": {"$ref": "#/$defs/nullable_datetime"},
+        "buy_price_min_date": {"$ref": "#/$defs/nullable_datetime"},
+        "buy_price_max_date": {"$ref": "#/$defs/nullable_datetime"}
+      }
+    }
+  },
+  "$defs": {
+    "price": {
+      "description": "Prix en argent du jeu : entier positif ou nul (0 = aucun ordre)",
+      "type": "number",
+      "minimum": 0,
+      "multipleOf": 1
+    },
+    "datetime": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,6})?(Z|[+-]\\d{2}:\\d{2})?$"
+    },
+    "nullable_datetime": {
+      "anyOf": [{"type": "null"}, {"$ref": "#/$defs/datetime"}]
+    }
+  }
+}
