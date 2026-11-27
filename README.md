@@ -163,10 +163,10 @@ flowchart LR
     subgraph Pipeline["Nouveau pipeline d'ingestion"]
         HF -->|HTTPS + HF_TOKEN<br/>vérification du sha| CON[Connecteur Python<br/>connectors/]
         CON -->|messages JSON| PROD[Producer Kafka]
-        PROD --> T1[[Topic<br/>albion.market.raw]]
+        PROD --> T1[[Topic<br/>albion.market.prices]]
         T1 --> CONS[Consumer + validation<br/>validation/ JSON Schema]
         CONS -->|valides, normalisés,<br/>dédupliqués| OUT[(data/output/)]
-        CONS -->|invalides +<br/>métadonnées d'erreur| DLQ[[Topic DLQ<br/>albion.market.dlq]]
+        CONS -->|invalides +<br/>métadonnées d'erreur| DLQ[[Topic DLQ<br/>albion.market.prices.dlq]]
     end
 
     AF{{Apache Airflow<br/>DAG quotidien}} -.orchestre.-> CON
@@ -174,8 +174,135 @@ flowchart LR
     LOG[/Logs structurés<br/>+ métriques/] -.-> Pipeline
 ```
 
-> Les noms de topics sont provisoires. Ils seront fixés et justifiés à l'étape 3.
+> Les topics, partitions et clés sont détaillés et justifiés à l'étape 3.
 
 Apache Airflow interviendra pour orchestrer les différentes étapes du nouveau pipeline. Kafka assurera le transport des messages, tandis que le système de validation permettra de distinguer les données conformes des données invalides. Ces dernières seront isolées dans une DLQ afin de pouvoir être analysées.
 
 Cette architecture permet de réutiliser un travail existant tout en construisant une nouvelle chaîne d'ingestion indépendante, automatisée et contrôlable.
+# Étape 3 – Transport des données avec Kafka
+
+## 3.1. Topics
+
+| Topic | Partitions | Rétention | Rôle |
+|---|---|---|---|
+| `albion.market.prices` | 3 | 7 jours | Prix du marché, un message par couple objet / ville / qualité |
+| `albion.market.prices.dlq` | 1 | 30 jours | *Dead-Letter Queue* : messages rejetés, avec les métadonnées de leur erreur |
+
+Les topics sont décrits dans [`kafka/scripts/config.py`](kafka/scripts/config.py) et créés par [`kafka/scripts/create_topics.py`](kafka/scripts/create_topics.py). Ce script peut être relancé sans risque : un topic déjà existant est conservé tel quel.
+
+**Pourquoi 3 partitions pour les prix ?** Le volume (environ 47 000 messages par lot) tiendrait sur une seule partition. Avec 3 partitions, on peut lancer jusqu'à 3 consumers en parallèle dans le même groupe si le volume augmente, par exemple en ajoutant d'autres serveurs du jeu. Ce nombre reste assez faible pour un seul broker et permet de vérifier concrètement la répartition des messages. Dans Kafka, on peut augmenter le nombre de partitions plus tard mais jamais le diminuer : partir petit est donc le choix prudent.
+
+**Pourquoi 1 partition pour la DLQ ?** Les rejets doivent rester rares. Une seule partition garde leur ordre d'arrivée, ce qui facilite l'analyse.
+
+**Rétention.** Les 7 jours du topic des prix permettent de rejouer un lot récent en cas de problème en aval. Les 30 jours de la DLQ laissent le temps d'analyser et de corriger les rejets.
+
+**Réplication.** Le facteur de réplication est de 1, car le `docker-compose.yml` ne lance qu'un seul broker. En production, on utiliserait 3 brokers, un facteur de réplication de 3 et `min.insync.replicas=2`.
+
+## 3.2. Clé de message
+
+La clé est `item_id|city|quality` (exemple : `T4_BAG|Caerleon|1`). C'est la clé métier d'une observation de prix.
+
+- **Ordre garanti par objet.** Tous les messages d'une même clé vont dans la même partition. Leur ordre est donc conservé, et une nouvelle observation d'un prix arrive toujours après l'ancienne.
+- **Déduplication facilitée.** Deux messages de même clé et de mêmes dates sont des doublons. L'étape de qualité peut les éliminer sur ce critère.
+- **Bonne répartition.** Il y a des milliers de clés différentes, donc le hachage les distribue de façon équilibrée. Avec `item_id` seul, la répartition serait plus grossière. Avec `city` seul, il n'y aurait que 7 valeurs, ce qui donnerait des partitions déséquilibrées.
+
+Un enregistrement auquel il manque un champ de la clé n'est pas publié. Il est comptabilisé dans `skipped`.
+
+## 3.3. Producer et consumer
+
+| Script | Rôle |
+|---|---|
+| [`producer.py`](kafka/scripts/producer.py) | Publie des dictionnaires Python. Le connecteur (étape 2) appelle `publish(records, run_id=...)`. Le script peut aussi être lancé en ligne de commande sur un fichier JSON Lines. |
+| [`consumer.py`](kafka/scripts/consumer.py) | Lit le topic des prix et écrit les messages dans `data/output/market_prices.jsonl`. Un message illisible est envoyé dans la DLQ. Le script s'arrête après une période sans message, ce qui le rend utilisable depuis Airflow. |
+| [`check_topics.py`](kafka/scripts/check_topics.py) | Affiche, pour chaque partition, le nombre de messages, l'offset commité et le *lag* (messages restant à lire). |
+| [`generate_sample.py`](kafka/scripts/generate_sample.py) | Génère un jeu fictif au format Albion (`data/input/sample_market_prices.jsonl`) pour tester Kafka sans le connecteur. |
+
+**Format d'un message.** La valeur est l'enregistrement du dataset en JSON (`item_id`, `city`, `quality`, `sell_price_min`, …). Les métadonnées sont placées dans les *headers* Kafka, pour ne pas mélanger données métier et données techniques :
+
+| Header | Contenu |
+|---|---|
+| `message_id` | UUID unique du message : identifiant de corrélation, réutilisable à l'étape 6 |
+| `run_id` | Identifiant du lot (par exemple l'identifiant du run Airflow) |
+| `produced_at` | Horodatage UTC de la publication |
+| `source` | Origine de la donnée |
+
+Un message envoyé dans la DLQ conserve ses headers d'origine. On y ajoute `error`, `error_stage`, `original_topic`, `original_partition`, `original_offset` et `failed_at`.
+
+## 3.4. Vérification
+
+Résultats obtenus avec le jeu d'exemple (300 lignes) et un message volontairement invalide (`{pas du json`) :
+
+```
+$ python kafka/scripts/producer.py --input data/input/sample_market_prices.jsonl
+"sent": 300, "delivered": 300, "failed": 0, "per_partition": {"0": 97, "1": 95, "2": 108}
+
+$ python kafka/scripts/consumer.py
+"consumed": 301, "written": 300, "dlq": 1
+
+$ python kafka/scripts/check_topics.py
+albion.market.prices  (3 partition(s), 301 message(s))
+  partition  messages   part   commité    lag
+          0        97    32%        97      0
+          1        96    32%        96      0
+          2       108    36%       108      0
+
+albion.market.prices.dlq  (1 partition(s), 1 message(s))
+```
+
+- **Publication** : 300 messages envoyés, 300 livrés.
+- **Consommation** : le lag est à 0 sur toutes les partitions, donc tout a été lu.
+- **Répartition** : environ un tiers des messages par partition. Aucune clé ne se retrouve sur deux partitions différentes.
+- **DLQ** : le message invalide y est arrivé avec l'erreur `JSON invalide : Expecting property name…` et sa position d'origine (partition 1, offset 95).
+
+Les messages sont aussi visibles dans Kafka-UI : http://localhost:8081.
+
+> Le lag affiché pour la DLQ est normal : aucun consumer ne lit encore ce topic. Son traitement relève de l'étape 5.
+
+## 3.5. Stratégie de reprise et risques de doublons
+
+**Côté producer**
+- `enable.idempotence=true` et `acks=all` : si un envoi échoue (coupure réseau, broker lent), le producer le renvoie automatiquement, jusqu'à 10 tentatives en 2 minutes au maximum. Kafka élimine les doublons créés par ces renvois.
+- Si la file d'envoi locale est pleine, le producer attend et réessaie au lieu de perdre le message.
+- À la fin, `publish()` renvoie le nombre de messages livrés et en échec. La tâche Airflow pourra échouer, puis être relancée, si `failed > 0`.
+
+**Côté consumer : garantie « au moins une fois »**
+- L'auto-commit est désactivé. Pour chaque lot de messages, le consumer : 1) écrit sur disque (avec `fsync`) et dans la DLQ, 2) commite seulement ensuite les offsets.
+- **Arrêt avant le commit** : les messages déjà écrits sont relus au redémarrage. On obtient des doublons, mais aucune perte.
+- **Arrêt avant l'écriture** : rien n'est commité, donc les messages sont relus. Il n'y a ni perte ni doublon.
+- **Relance normale** : le consumer reprend à l'offset commité. Vérifié : une seconde exécution lit 0 message.
+
+**Doublons qui subsistent, et comment les traiter**
+
+| Cas | Cause | Traitement |
+|---|---|---|
+| Crash du consumer entre l'écriture et le commit | Garantie « au moins une fois » | Déduplication à l'étape 5 sur la clé `item_id\|city\|quality` et les dates de prix |
+| Relance du producer sur le même lot | Le fichier source est republié entièrement. Vérifié : republier les 300 lignes ajoute 300 messages, répartis sur les mêmes partitions. | Le connecteur ne publie pas si le `sha` du dataset n'a pas changé (étapes 2 et 4), et la déduplication de l'étape 5 sert de filet de sécurité |
+| Relance d'une tâche Airflow | Même cas que le précédent | `run_id` fixé par Airflow, plus les deux mécanismes ci-dessus |
+
+Une garantie « exactement une fois » de bout en bout demanderait des transactions Kafka et une écriture transactionnelle en sortie. Pour un lot quotidien de petite taille, la combinaison « au moins une fois » et déduplication est plus simple, et suffit.
+
+## 3.6. Lancer l'étape 3
+
+```bash
+# 1. Démarrer Kafka et Kafka-UI
+docker compose up -d kafka kafka-ui
+
+# 2. Environnement Python
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# 3. Créer les topics
+python kafka/scripts/create_topics.py
+
+# 4. Publier le jeu d'exemple (en attendant le connecteur)
+python kafka/scripts/generate_sample.py
+python kafka/scripts/producer.py --input data/input/sample_market_prices.jsonl
+
+# 5. Consommer, puis vérifier la répartition et le lag
+python kafka/scripts/consumer.py
+python kafka/scripts/check_topics.py
+```
+
+Variables d'environnement disponibles :
+- `KAFKA_BOOTSTRAP_SERVERS` : `localhost:9092` par défaut. Depuis un conteneur, comme Airflow, utiliser `kafka:29092`.
+- `KAFKA_TOPIC_PRICES`, `KAFKA_TOPIC_DLQ` et `KAFKA_CONSUMER_GROUP` : noms des topics et du groupe de consumers.
