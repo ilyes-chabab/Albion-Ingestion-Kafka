@@ -4,7 +4,8 @@ Format attendu d'un message (celui de connectors/albion_connector.py) :
     {"source": "...", "extract_date": "...", "data": {"item_id": ..., "city": ..., "quality": ..., ...}}
 
 Utilisation :
-    python kafka/scripts/producer.py --source connector          # vraies données Hugging Face
+    python kafka/scripts/producer.py --source connector          # vraies données, si le dataset a changé
+    python kafka/scripts/producer.py --source connector --force  # republier même sans changement
     python kafka/scripts/producer.py --source data/input/sample_market_prices.jsonl   # jeu d'exemple
 """
 import argparse
@@ -98,6 +99,8 @@ def publish(
             ("produced_at", datetime.now(timezone.utc).isoformat()),
             ("source", str(message.get("source", "unknown"))),
         ]
+        if message.get("dataset_sha"):
+            headers.append(("dataset_sha", str(message["dataset_sha"])))  # version du dataset publiée
         while True:
             try:
                 producer.produce(
@@ -132,12 +135,38 @@ def read_jsonl(path: str) -> Iterable[dict]:
                 yield json.loads(line)
 
 
-def read_connector() -> Iterable[dict]:
-    """Messages extraits par le connecteur Hugging Face (étape 2)."""
+def _load_connector():
     sys.path.insert(0, str(PROJECT_ROOT / "connectors"))
-    from albion_connector import extract_data  # import tardif : dépendances propres au connecteur
+    import albion_connector  # import tardif : dépendances propres au connecteur
 
-    return extract_data()
+    return albion_connector
+
+
+def read_connector(revision: Optional[str] = None) -> Iterable[dict]:
+    """Messages extraits par le connecteur Hugging Face (étape 2)."""
+    return _load_connector().extract_data(revision)
+
+
+def publish_from_connector(run_id: Optional[str] = None, force: bool = False) -> dict:
+    """Extraction incrémentale : ne publie que si le dataset a changé depuis la dernière ingestion.
+
+    Le sha n'est enregistré qu'après la livraison de TOUS les messages : si la publication
+    échoue, la version n'est pas marquée comme ingérée et sera retentée au prochain lancement.
+    """
+    connector = _load_connector()
+    sha, is_new = connector.check_new_version()
+    if not is_new and not force:
+        return {"run_id": run_id, "dataset_sha": sha, "status": "unchanged", "sent": 0, "delivered": 0,
+                "failed": 0, "skipped": 0}
+
+    stats = publish(connector.extract_data(sha), run_id=run_id)
+    stats["dataset_sha"] = sha
+    if stats["failed"] == 0:
+        connector.save_last_sha(sha, run_id=stats["run_id"], rows=stats["delivered"])
+        stats["status"] = "ingested"
+    else:
+        stats["status"] = "failed"  # sha non enregistré : la version sera republiée au prochain lancement
+    return stats
 
 
 def main() -> int:
@@ -145,10 +174,14 @@ def main() -> int:
     parser.add_argument("--source", required=True,
                         help="'connector' pour le connecteur Hugging Face, ou chemin d'un fichier JSON Lines")
     parser.add_argument("--run-id", default=None)
+    parser.add_argument("--force", action="store_true",
+                        help="avec --source connector : republier même si le dataset n'a pas changé")
     args = parser.parse_args()
 
-    records = read_connector() if args.source == "connector" else read_jsonl(args.source)
-    stats = publish(records, run_id=args.run_id)
+    if args.source == "connector":
+        stats = publish_from_connector(run_id=args.run_id, force=args.force)
+    else:
+        stats = publish(read_jsonl(args.source), run_id=args.run_id)
     print(json.dumps(stats, ensure_ascii=False, indent=2))
     return 0 if stats["failed"] == 0 else 1
 

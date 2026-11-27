@@ -4,8 +4,13 @@ __pycache__/
 .env
 .DS_Store
 
-# Cache de téléchargement Hugging Face
+# Données téléchargées depuis Hugging Face (dataset à accès contrôlé : jamais versionnées)
 data/input/.cache/
+data/input/data/
+*.parquet
+
+# État de l'extraction incrémentale (dernier sha ingéré)
+data/state/
 
 # Résultats générés par le pipeline
 data/output/*

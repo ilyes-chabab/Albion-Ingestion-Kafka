@@ -77,7 +77,8 @@ Le format Parquet a été conservé dans le projet initial pour stocker les donn
 ### Accès à la source
 
 - **Protocole** : HTTPS, via la bibliothèque `huggingface_hub` (ou l'URL `https://huggingface.co/datasets/Sayli84/albion-online-market-prices/resolve/main/data/market_prices.parquet`).
-- **Authentification** : le dataset est *gated*. Une requête anonyme renvoie une erreur `401`. Il faut un compte Hugging Face ayant accepté les conditions d'accès, ainsi qu'un token de lecture. Ce token sera fourni par variable d'environnement (`HF_TOKEN`) et ne sera jamais versionné dans le dépôt.
+- **Authentification** : le dataset est *gated*. Une requête anonyme renvoie une erreur `401`. Il faut un compte Hugging Face ayant accepté les conditions d'accès, ainsi qu'un token de lecture. Ce token est fourni par variable d'environnement (`HF_TOKEN`, dans un fichier `.env`) et n'est jamais versionné dans le dépôt.
+- **Fichier de données non versionné** : le Parquet est téléchargé dans `data/input/` à chaque exécution et ignoré par Git. Le versionner rendrait le dataset accessible sans passer par le contrôle d'accès de Hugging Face, ce que la consigne déconseille aussi.
 - **Détection des nouveautés** : l'API Hugging Face (`/api/datasets/Sayli84/albion-online-market-prices`) expose le hash du dernier commit (`sha`) et la date `lastModified`. Le connecteur pourra ainsi savoir si le fichier a changé depuis la dernière ingestion sans le retélécharger.
 
 ### Limites de la source
@@ -225,6 +226,7 @@ Les champs de la clé sont lus dans l'enveloppe `data` du message (voir 3.3). Un
 ```json
 {
   "source": "HF_albion_online_market_prices",
+  "dataset_sha": "7bec455e16acef0b4646d33a0ef646a53759ebc5",
   "extract_date": "2026-11-27T10:19:38.287640+00:00",
   "data": {
     "item_id": "T3_MAIN_ARCANESTAFF", "city": "Black Market", "quality": 2,
@@ -244,6 +246,7 @@ Les métadonnées techniques propres à Kafka sont placées dans les *headers*, 
 | `run_id` | Identifiant du lot (par exemple l'identifiant du run Airflow) |
 | `produced_at` | Horodatage UTC de la publication |
 | `source` | Recopié du champ `source` du message |
+| `dataset_sha` | Version du dataset Hugging Face d'où vient le message |
 
 Un message envoyé dans la DLQ conserve ses headers d'origine. On y ajoute `error`, `error_stage`, `original_topic`, `original_partition`, `original_offset` et `failed_at`.
 
@@ -291,6 +294,26 @@ Les messages sont aussi visibles dans Kafka-UI : http://localhost:8081.
 - Si la file d'envoi locale est pleine, le producer attend et réessaie au lieu de perdre le message.
 - À la fin, `publish()` renvoie le nombre de messages livrés et en échec. La tâche Airflow pourra échouer, puis être relancée, si `failed > 0`.
 
+**Côté connecteur : extraction incrémentale par `sha`**
+
+Le dataset est remplacé en entier à chaque publication. On ne peut donc pas extraire « seulement les nouvelles lignes ». On ne republie le fichier que s'il a changé :
+
+1. `check_new_version()` lit le `sha` actuel du dataset dans l'API Hugging Face. Ces métadonnées sont publiques : aucun token n'est nécessaire à cette étape.
+2. Il compare ce `sha` à celui de la dernière ingestion réussie, enregistré dans `data/state/last_ingested.json`.
+3. Si le `sha` est identique, rien n'est publié (`"status": "unchanged"`).
+4. Sinon, le fichier est téléchargé **à cette version précise** (`revision=sha`). On est ainsi sûr que les données correspondent bien au `sha` enregistré.
+5. Le `sha` n'est enregistré qu'une fois **tous** les messages livrés à Kafka. Si la publication échoue, la version n'est pas marquée et sera republiée au prochain lancement.
+
+| Scénario testé | Résultat |
+|---|---|
+| Première ingestion | 47 926 messages publiés, `sha` enregistré (`status: ingested`) |
+| Relance, dataset inchangé | 0 message publié (`status: unchanged`) |
+| Kafka arrêté pendant la publication | 47 926 échecs, `sha` **non** enregistré (`status: failed`) |
+| Relance après le retour de Kafka | 47 926 messages publiés, `sha` enregistré |
+| `--force` | Republication même sans changement, pour rejouer un lot volontairement |
+
+Le dossier `data/state/` n'est pas versionné, car il décrit l'état d'une installation.
+
 **Côté consumer : garantie « au moins une fois »**
 - L'auto-commit est désactivé. Pour chaque lot de messages, le consumer : 1) écrit sur disque (avec `fsync`) et dans la DLQ, 2) commite seulement ensuite les offsets.
 - **Arrêt avant le commit** : les messages déjà écrits sont relus au redémarrage. On obtient des doublons, mais aucune perte.
@@ -303,7 +326,7 @@ Les messages sont aussi visibles dans Kafka-UI : http://localhost:8081.
 |---|---|---|
 | Doublons présents dans le fichier source | 280 clés apparaissent plusieurs fois dans le Parquet | Déduplication à l'étape 5 |
 | Crash du consumer entre l'écriture et le commit | Garantie « au moins une fois » | Déduplication à l'étape 5 sur la clé `item_id\|city\|quality` et les dates de prix |
-| Relance du producer sur le même lot | Le fichier source est republié entièrement. Vérifié : republier les 300 lignes du jeu d'exemple ajoute 300 messages, sur les mêmes partitions. | Le connecteur ne publie pas si le `sha` du dataset n'a pas changé (étapes 2 et 4), et la déduplication de l'étape 5 sert de filet de sécurité |
+| Relance du producer sur le même lot | Ne se produit plus qu'avec `--force`, ou après un échec partiel. Le fichier source est alors republié entièrement. Vérifié : republier les 300 lignes du jeu d'exemple ajoute 300 messages, sur les mêmes partitions. | Le connecteur ne publie pas si le `sha` du dataset n'a pas changé (voir plus haut), et la déduplication de l'étape 5 sert de filet de sécurité |
 | Relance d'une tâche Airflow | Même cas que le précédent | `run_id` fixé par Airflow, plus les deux mécanismes ci-dessus |
 
 Une garantie « exactement une fois » de bout en bout demanderait des transactions Kafka et une écriture transactionnelle en sortie. Pour un lot quotidien de petite taille, la combinaison « au moins une fois » et déduplication est plus simple, et suffit.
@@ -322,7 +345,9 @@ pip install -r requirements.txt
 python kafka/scripts/create_topics.py
 
 # 4a. Publier les vraies données (HF_TOKEN dans le fichier .env, voir étape 2)
+#     Ne publie rien si le dataset n'a pas changé depuis la dernière ingestion.
 python kafka/scripts/producer.py --source connector
+python kafka/scripts/producer.py --source connector --force   # pour republier quand même
 
 # 4b. ou publier le jeu d'exemple, sans token
 python kafka/scripts/generate_sample.py
