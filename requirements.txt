@@ -1,1 +1,9 @@
+# Connecteur (étape 2)
+pandas
+pyarrow
+huggingface_hub
+kafka-python
+python-dotenv
+
+# Kafka (étape 3)
 confluent-kafka==2.6.1
