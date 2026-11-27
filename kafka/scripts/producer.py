@@ -1,7 +1,11 @@
-"""Producer Kafka : publie des enregistrements de prix (dictionnaires) dans le topic des prix.
+"""Producer Kafka : publie dans le topic des prix les messages produits par le connecteur.
 
-Utilisable comme module (le connecteur appelle `publish(records)`) ou en ligne de commande :
-    python kafka/scripts/producer.py --input data/input/sample_market_prices.jsonl
+Format attendu d'un message (celui de connectors/albion_connector.py) :
+    {"source": "...", "extract_date": "...", "data": {"item_id": ..., "city": ..., "quality": ..., ...}}
+
+Utilisation :
+    python kafka/scripts/producer.py --source connector          # vraies données Hugging Face
+    python kafka/scripts/producer.py --source data/input/sample_market_prices.jsonl   # jeu d'exemple
 """
 import argparse
 import json
@@ -9,21 +13,36 @@ import sys
 import uuid
 from collections import Counter
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Iterable, Optional
 
 from confluent_kafka import Producer
 
 import config
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 KEY_FIELDS = ("item_id", "city", "quality")
 
 
-def build_key(record: dict) -> str:
-    """Clé métier : un même objet, dans une même ville, à une même qualité."""
-    missing = [f for f in KEY_FIELDS if record.get(f) in (None, "")]
+def build_key(message: dict) -> str:
+    """Clé métier : un même objet, dans une même ville, à une même qualité.
+
+    Les champs sont lus dans l'enveloppe `data` du connecteur.
+    """
+    data = message.get("data")
+    if not isinstance(data, dict):
+        raise ValueError("champ 'data' absent ou invalide")
+    missing = [f for f in KEY_FIELDS if data.get(f) in (None, "")]
     if missing:
         raise ValueError(f"champs de clé manquants : {missing}")
-    return "|".join(str(record[f]) for f in KEY_FIELDS)
+    return "|".join(str(data[f]) for f in KEY_FIELDS)
+
+
+def _json_default(value):
+    """Sérialise les types non JSON du Parquet (timestamps) au format ISO 8601."""
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
 
 
 def make_producer(bootstrap_servers: str = config.BOOTSTRAP_SERVERS) -> Producer:
@@ -64,27 +83,27 @@ def publish(
             stats["delivered"] += 1
             per_partition[msg.partition()] += 1
 
-    for record in records:
+    for message in records:
         try:
-            key = build_key(record)
+            key = build_key(message)
         except ValueError as exc:
-            # Sans clé, on ne peut pas partitionner correctement : l'enregistrement est écarté
+            # Sans clé, on ne peut pas partitionner correctement : le message est écarté
             stats["skipped"] += 1
-            errors.append(f"enregistrement ignoré ({exc}) : {record}")
+            errors.append(f"message ignoré ({exc}) : {message}")
             continue
 
         headers = [
             ("message_id", str(uuid.uuid4())),  # identifiant de corrélation du message
             ("run_id", run_id),  # identifiant du lot (ex : run Airflow)
             ("produced_at", datetime.now(timezone.utc).isoformat()),
-            ("source", "huggingface:Sayli84/albion-online-market-prices"),
+            ("source", str(message.get("source", "unknown"))),
         ]
         while True:
             try:
                 producer.produce(
                     topic,
                     key=key.encode("utf-8"),
-                    value=json.dumps(record, ensure_ascii=False, default=str).encode("utf-8"),
+                    value=json.dumps(message, ensure_ascii=False, default=_json_default).encode("utf-8"),
                     headers=headers,
                     on_delivery=on_delivery,
                 )
@@ -113,13 +132,23 @@ def read_jsonl(path: str) -> Iterable[dict]:
                 yield json.loads(line)
 
 
+def read_connector() -> Iterable[dict]:
+    """Messages extraits par le connecteur Hugging Face (étape 2)."""
+    sys.path.insert(0, str(PROJECT_ROOT / "connectors"))
+    from albion_connector import extract_data  # import tardif : dépendances propres au connecteur
+
+    return extract_data()
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", required=True, help="fichier JSON Lines à publier")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--source", required=True,
+                        help="'connector' pour le connecteur Hugging Face, ou chemin d'un fichier JSON Lines")
     parser.add_argument("--run-id", default=None)
     args = parser.parse_args()
 
-    stats = publish(read_jsonl(args.input), run_id=args.run_id)
+    records = read_connector() if args.source == "connector" else read_jsonl(args.source)
+    stats = publish(records, run_id=args.run_id)
     print(json.dumps(stats, ensure_ascii=False, indent=2))
     return 0 if stats["failed"] == 0 else 1
 

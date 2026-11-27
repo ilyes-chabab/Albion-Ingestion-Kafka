@@ -48,7 +48,7 @@ La source de données utilisée est le dataset *Albion Online Market Prices*, h�
 | Nom du dataset | Sayli84/albion-online-market-prices |
 | Fichier | `data/market_prices.parquet` (fichier unique) |
 | Taille approximative | 431 Ko |
-| Nombre de lignes | Environ 47 000 |
+| Nombre de lignes | 47 926 |
 | Périmètre | Serveur européen d'Albion Online |
 | Accès | Dataset public mais à accès contrôlé (*gated*) : authentification par token Hugging Face obligatoire |
 | Fréquence de mise à jour | Publication ponctuelle par snapshot (dernière mise à jour : 6 novembre 2026) |
@@ -70,6 +70,8 @@ Les fichiers Parquet contiennent les informations suivantes :
 | `buy_price_max` | Prix maximum d'achat |
 | `buy_price_max_date` | Date associée au prix maximum d'achat |
 
+Types observés dans le fichier : `item_id` et `city` sont des chaînes, `quality` un entier de 1 à 5, les prix des décimaux (`double`) et les dates des `timestamp` sans fuseau horaire. Le fichier couvre 8 villes, dont le **Black Market**, et des observations allant du 3 au 4 novembre 2026.
+
 Le format Parquet a été conservé dans le projet initial pour stocker les données de manière structurée et compacte. Dans le nouveau pipeline, ces données seront lues avec Python, puis transformées en messages JSON pour être envoyées dans Kafka.
 
 ### Accès à la source
@@ -83,7 +85,8 @@ Le format Parquet a été conservé dans le projet initial pour stocker les donn
 - **Pas de temps réel** : le fichier est un snapshot figé. Il ne reflète l'état du marché qu'au moment de son export depuis la base SQL.
 - **Pas d'incrémental natif** : le fichier est remplacé en entier à chaque publication. L'extraction incrémentale doit donc se faire côté pipeline (comparaison du `sha` et déduplication sur une clé métier).
 - **Données collaboratives** : les prix de l'Albion Online Data Project proviennent des clients des joueurs. Certains couples objet / ville / qualité peuvent être absents ou anciens.
-- **Valeurs par défaut** : l'API d'origine renvoie un prix à `0` et une date par défaut (`0001-01-01T00:00:00`) lorsqu'aucun ordre n'existe. Ces valeurs devront être détectées pendant la validation.
+- **Prix manquants** : quand aucun ordre n'existe, le prix vaut `0.0` et la date associée est nulle. C'est le cas pour 70 % des prix de vente (33 401 lignes) et 84 % des prix d'achat (40 205 lignes). La validation devra traiter ces valeurs comme des absences de prix, et non comme des prix gratuits.
+- **Doublons dans la source** : 280 combinaisons `item_id` / `city` / `quality` apparaissent plusieurs fois dans le fichier (47 640 combinaisons distinctes pour 47 926 lignes). La déduplication est donc nécessaire.
 - **Dépendance à un service tiers** : la disponibilité de Hugging Face, les limites de débit et le jeton d'accès peuvent provoquer des erreurs de téléchargement. Le connecteur devra donc gérer les reprises.
 - **Périmètre limité** : seul le serveur européen est couvert.
 
@@ -93,7 +96,7 @@ Les données peuvent être caractérisées selon les trois dimensions suivantes 
 
 **Volume**
 
-Le dataset contient environ 47 000 lignes pour une taille totale d'environ 431 Ko. Ce volume reste relativement faible, ce qui permet de réaliser les traitements avec des ressources informatiques limitées. Il est néanmoins suffisant pour tester les mécanismes d'ingestion, de transport et de validation de Kafka.
+Le dataset contient 47 926 lignes pour une taille totale d'environ 431 Ko. Ce volume reste relativement faible, ce qui permet de réaliser les traitements avec des ressources informatiques limitées. Il est néanmoins suffisant pour tester les mécanismes d'ingestion, de transport et de validation de Kafka.
 
 **Vélocité**
 
@@ -109,7 +112,7 @@ La variété est faible : une seule source, un seul format et un schéma stable.
 
 | Dimension | Niveau | Conséquence pour le pipeline |
 |---|---|---|
-| Volume | Faible (environ 47 000 lignes, environ 431 Ko) | Traitement en mémoire avec pandas, sans moteur distribué |
+| Volume | Faible (47 926 lignes, environ 431 Ko) | Traitement en mémoire avec pandas, sans moteur distribué |
 | Vélocité | Faible (snapshots ponctuels) | Ingestion par lots planifiée, pas de streaming temps réel |
 | Variété | Faible (Parquet, schéma fixe) | Un contrat de données unique (JSON Schema) suffit |
 
@@ -190,7 +193,7 @@ Cette architecture permet de réutiliser un travail existant tout en construisan
 
 Les topics sont décrits dans [`kafka/scripts/config.py`](kafka/scripts/config.py) et créés par [`kafka/scripts/create_topics.py`](kafka/scripts/create_topics.py). Ce script peut être relancé sans risque : un topic déjà existant est conservé tel quel.
 
-**Pourquoi 3 partitions pour les prix ?** Le volume (environ 47 000 messages par lot) tiendrait sur une seule partition. Avec 3 partitions, on peut lancer jusqu'à 3 consumers en parallèle dans le même groupe si le volume augmente, par exemple en ajoutant d'autres serveurs du jeu. Ce nombre reste assez faible pour un seul broker et permet de vérifier concrètement la répartition des messages. Dans Kafka, on peut augmenter le nombre de partitions plus tard mais jamais le diminuer : partir petit est donc le choix prudent.
+**Pourquoi 3 partitions pour les prix ?** Le volume (47 926 messages par lot) tiendrait sur une seule partition. Avec 3 partitions, on peut lancer jusqu'à 3 consumers en parallèle dans le même groupe si le volume augmente, par exemple en ajoutant d'autres serveurs du jeu. Ce nombre reste assez faible pour un seul broker et permet de vérifier concrètement la répartition des messages. Dans Kafka, on peut augmenter le nombre de partitions plus tard mais jamais le diminuer : partir petit est donc le choix prudent.
 
 **Pourquoi 1 partition pour la DLQ ?** Les rejets doivent rester rares. Une seule partition garde leur ordre d'arrivée, ce qui facilite l'analyse.
 
@@ -206,53 +209,76 @@ La clé est `item_id|city|quality` (exemple : `T4_BAG|Caerleon|1`). C'est la cl�
 - **Déduplication facilitée.** Deux messages de même clé et de mêmes dates sont des doublons. L'étape de qualité peut les éliminer sur ce critère.
 - **Bonne répartition.** Il y a des milliers de clés différentes, donc le hachage les distribue de façon équilibrée. Avec `item_id` seul, la répartition serait plus grossière. Avec `city` seul, il n'y aurait que 7 valeurs, ce qui donnerait des partitions déséquilibrées.
 
-Un enregistrement auquel il manque un champ de la clé n'est pas publié. Il est comptabilisé dans `skipped`.
+Les champs de la clé sont lus dans l'enveloppe `data` du message (voir 3.3). Un message auquel il manque un champ de la clé n'est pas publié. Il est comptabilisé dans `skipped`.
 
 ## 3.3. Producer et consumer
 
 | Script | Rôle |
 |---|---|
-| [`producer.py`](kafka/scripts/producer.py) | Publie des dictionnaires Python. Le connecteur (étape 2) appelle `publish(records, run_id=...)`. Le script peut aussi être lancé en ligne de commande sur un fichier JSON Lines. |
+| [`producer.py`](kafka/scripts/producer.py) | Publie les messages du connecteur (étape 2). En ligne de commande : `--source connector` pour les vraies données Hugging Face, ou `--source <fichier.jsonl>` pour un fichier JSON Lines. En Python : `publish(extract_data(), run_id=...)`. |
 | [`consumer.py`](kafka/scripts/consumer.py) | Lit le topic des prix et écrit les messages dans `data/output/market_prices.jsonl`. Un message illisible est envoyé dans la DLQ. Le script s'arrête après une période sans message, ce qui le rend utilisable depuis Airflow. |
 | [`check_topics.py`](kafka/scripts/check_topics.py) | Affiche, pour chaque partition, le nombre de messages, l'offset commité et le *lag* (messages restant à lire). |
-| [`generate_sample.py`](kafka/scripts/generate_sample.py) | Génère un jeu fictif au format Albion (`data/input/sample_market_prices.jsonl`) pour tester Kafka sans le connecteur. |
+| [`generate_sample.py`](kafka/scripts/generate_sample.py) | Génère un jeu fictif de 300 lignes au format du connecteur (`data/input/sample_market_prices.jsonl`), pour tester Kafka sans token Hugging Face. |
 
-**Format d'un message.** La valeur est l'enregistrement du dataset en JSON (`item_id`, `city`, `quality`, `sell_price_min`, …). Les métadonnées sont placées dans les *headers* Kafka, pour ne pas mélanger données métier et données techniques :
+**Format d'un message.** La valeur reprend l'enveloppe produite par le connecteur, sérialisée en JSON. Les timestamps du Parquet sont convertis au format ISO 8601.
+
+```json
+{
+  "source": "HF_albion_online_market_prices",
+  "extract_date": "2026-11-27T10:19:38.287640+00:00",
+  "data": {
+    "item_id": "T3_MAIN_ARCANESTAFF", "city": "Black Market", "quality": 2,
+    "sell_price_min": 0.0, "sell_price_min_date": null,
+    "sell_price_max": 0.0, "sell_price_max_date": null,
+    "buy_price_min": 708.0, "buy_price_min_date": "2026-11-04T06:45:00",
+    "buy_price_max": 3658.0, "buy_price_max_date": "2026-11-04T06:45:00"
+  }
+}
+```
+
+Les métadonnées techniques propres à Kafka sont placées dans les *headers*, pour ne pas les mélanger avec les données :
 
 | Header | Contenu |
 |---|---|
 | `message_id` | UUID unique du message : identifiant de corrélation, réutilisable à l'étape 6 |
 | `run_id` | Identifiant du lot (par exemple l'identifiant du run Airflow) |
 | `produced_at` | Horodatage UTC de la publication |
-| `source` | Origine de la donnée |
+| `source` | Recopié du champ `source` du message |
 
 Un message envoyé dans la DLQ conserve ses headers d'origine. On y ajoute `error`, `error_stage`, `original_topic`, `original_partition`, `original_offset` et `failed_at`.
 
 ## 3.4. Vérification
 
-Résultats obtenus avec le jeu d'exemple (300 lignes) et un message volontairement invalide (`{pas du json`) :
+**Test 1 : données réelles.** Le fichier `market_prices.parquet` (47 926 lignes) passe par le connecteur de l'étape 2, plus le jeu d'exemple (300 lignes) :
 
 ```
-$ python kafka/scripts/producer.py --input data/input/sample_market_prices.jsonl
-"sent": 300, "delivered": 300, "failed": 0, "per_partition": {"0": 97, "1": 95, "2": 108}
+$ python kafka/scripts/producer.py --source connector
+"sent": 47926, "delivered": 47926, "failed": 0, "skipped": 0,
+"per_partition": {"0": 15915, "1": 15963, "2": 16048}
 
 $ python kafka/scripts/consumer.py
-"consumed": 301, "written": 300, "dlq": 1
+"consumed": 48226, "written": 48226, "dlq": 0
 
 $ python kafka/scripts/check_topics.py
-albion.market.prices  (3 partition(s), 301 message(s))
+albion.market.prices  (3 partition(s), 48226 message(s))
   partition  messages   part   commité    lag
-          0        97    32%        97      0
-          1        96    32%        96      0
-          2       108    36%       108      0
-
-albion.market.prices.dlq  (1 partition(s), 1 message(s))
+          0     16004    33%     16004      0
+          1     16062    33%     16062      0
+          2     16160    34%     16160      0
 ```
 
-- **Publication** : 300 messages envoyés, 300 livrés.
+- **Publication** : les 47 926 lignes réelles ont été livrées, sans échec ni ligne écartée.
 - **Consommation** : le lag est à 0 sur toutes les partitions, donc tout a été lu.
-- **Répartition** : environ un tiers des messages par partition. Aucune clé ne se retrouve sur deux partitions différentes.
-- **DLQ** : le message invalide y est arrivé avec l'erreur `JSON invalide : Expecting property name…` et sa position d'origine (partition 1, offset 95).
+- **Répartition** : 33 % / 33 % / 34 %. La clé répartit les messages de façon équilibrée, et aucune clé ne se retrouve sur deux partitions différentes.
+
+**Test 2 : message invalide.** Un message qui n'est pas du JSON (`{pas du json`) est injecté avec `kafka-console-producer` :
+
+```
+$ python kafka/scripts/consumer.py
+"consumed": 301, "written": 300, "dlq": 1
+```
+
+Le message est arrivé dans la DLQ avec l'erreur `JSON invalide : Expecting property name…` et sa position d'origine (partition 1, offset 95).
 
 Les messages sont aussi visibles dans Kafka-UI : http://localhost:8081.
 
@@ -275,8 +301,9 @@ Les messages sont aussi visibles dans Kafka-UI : http://localhost:8081.
 
 | Cas | Cause | Traitement |
 |---|---|---|
+| Doublons présents dans le fichier source | 280 clés apparaissent plusieurs fois dans le Parquet | Déduplication à l'étape 5 |
 | Crash du consumer entre l'écriture et le commit | Garantie « au moins une fois » | Déduplication à l'étape 5 sur la clé `item_id\|city\|quality` et les dates de prix |
-| Relance du producer sur le même lot | Le fichier source est republié entièrement. Vérifié : republier les 300 lignes ajoute 300 messages, répartis sur les mêmes partitions. | Le connecteur ne publie pas si le `sha` du dataset n'a pas changé (étapes 2 et 4), et la déduplication de l'étape 5 sert de filet de sécurité |
+| Relance du producer sur le même lot | Le fichier source est republié entièrement. Vérifié : republier les 300 lignes du jeu d'exemple ajoute 300 messages, sur les mêmes partitions. | Le connecteur ne publie pas si le `sha` du dataset n'a pas changé (étapes 2 et 4), et la déduplication de l'étape 5 sert de filet de sécurité |
 | Relance d'une tâche Airflow | Même cas que le précédent | `run_id` fixé par Airflow, plus les deux mécanismes ci-dessus |
 
 Une garantie « exactement une fois » de bout en bout demanderait des transactions Kafka et une écriture transactionnelle en sortie. Pour un lot quotidien de petite taille, la combinaison « au moins une fois » et déduplication est plus simple, et suffit.
@@ -294,9 +321,12 @@ pip install -r requirements.txt
 # 3. Créer les topics
 python kafka/scripts/create_topics.py
 
-# 4. Publier le jeu d'exemple (en attendant le connecteur)
+# 4a. Publier les vraies données (HF_TOKEN dans le fichier .env, voir étape 2)
+python kafka/scripts/producer.py --source connector
+
+# 4b. ou publier le jeu d'exemple, sans token
 python kafka/scripts/generate_sample.py
-python kafka/scripts/producer.py --input data/input/sample_market_prices.jsonl
+python kafka/scripts/producer.py --source data/input/sample_market_prices.jsonl
 
 # 5. Consommer, puis vérifier la répartition et le lag
 python kafka/scripts/consumer.py
